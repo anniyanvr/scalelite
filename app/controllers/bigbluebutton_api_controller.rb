@@ -3,7 +3,24 @@
 class BigBlueButtonApiController < ApplicationController
   include ApiHelper
 
-  before_action :verify_checksum, except: [:index, :get_recordings_disabled, :recordings_disabled, :get_meetings_disabled]
+  skip_before_action :verify_authenticity_token
+
+  # Check content types on endpoints that accept POST requests. For most endpoints, form data is permitted.
+  before_action :verify_content_type, except: [:create, :insert_document, :join, :publish_recordings, :delete_recordings, :analytics_callback]
+  # create allows either form data or XML
+  before_action :verify_create_content_type, only: [:create]
+  # insertDocument only allows XML
+  before_action :verify_insert_document_content_type, only: [:insert_document]
+
+  before_action :verify_checksum, except: [:index, :get_recordings_disabled, :recordings_disabled, :get_meetings_disabled,
+                                           :analytics_callback,]
+
+  before_action :set_tenant, except: [:index, :get_recordings_disabled, :recordings_disabled, :get_meetings_disabled],
+                if: -> { Rails.configuration.x.multitenancy_enabled }
+
+  before_action :remove_non_scalar_params, except: :analytics_callback
+
+  before_action :normalize_meta_params
 
   def index
     # Return the scalelite build number if passed as an env variable
@@ -24,7 +41,7 @@ class BigBlueButtonApiController < ApplicationController
     params.require(:meetingID)
 
     begin
-      meeting = Meeting.find(params[:meetingID])
+      meeting = Meeting.find(params[:meetingID], @tenant&.id)
     rescue ApplicationRedisRecord::RecordNotFound
       # Respond with MeetingNotFoundError if the meeting could not be found
       logger.info("The requested meeting #{params[:meetingID]} does not exist")
@@ -57,7 +74,7 @@ class BigBlueButtonApiController < ApplicationController
     params.require(:meetingID)
 
     begin
-      meeting = Meeting.find(params[:meetingID])
+      meeting = Meeting.find(params[:meetingID], @tenant&.id)
     rescue ApplicationRedisRecord::RecordNotFound
       # Respond with false if the meeting could not be found
       logger.info("The requested meeting #{params[:meetingID]} does not exist")
@@ -105,13 +122,27 @@ class BigBlueButtonApiController < ApplicationController
 
     # Make individual getMeetings call for each server and append result to all_meetings
     servers.each do |server|
-      next unless server.online && server.enabled # only send getMeetings requests to servers that are online and enabled
+      # only send getMeetings requests to servers that have state as enabled/cordoned
+      next if server.offline? || server.disabled?
 
       uri = encode_bbb_uri('getMeetings', server.url, server.secret)
 
       begin
         # Send a GET request to the server
         response = get_post_req(uri)
+
+        # filter to only show messages for current Tenant
+        if @tenant.present?
+          response.xpath('/response/meetings/meeting').each do |m|
+            meeting_tenant_id = m.xpath('metadata/tenant-id').text
+            m.remove if meeting_tenant_id != @tenant.id
+          end
+        else
+          response.xpath('/response/meetings/meeting').each do |m|
+            meeting_tenant_id = m.xpath('metadata/tenant-id').text
+            m.remove if meeting_tenant_id.present?
+          end
+        end
 
         # Skip over if no meetings on this server
         server_meetings = response.xpath('/response/meetings/meeting')
@@ -139,24 +170,61 @@ class BigBlueButtonApiController < ApplicationController
   def create
     params.require(:meetingID)
 
+    apply_config_server_tag(params)
     begin
-      server = Server.find_available
+      # Check if meeting is already running
+      meeting = Meeting.find(params[:meetingID], @tenant&.id)
+      server = meeting.server
+
+      # Handle edge case where stale meeting persists on cordoned server
+      if server.cordoned? && !meeting_running_on_server?(meeting)
+        logger.info("Meeting #{params[:meetingID]} no longer running on cordoned server #{server.id}; re-allocating.")
+        meeting.destroy!
+        raise ApplicationRedisRecord::RecordNotFound.new('stale meeting on cordoned server', 'Meeting', params[:meetingID])
+      end
+
+      logger.debug("Found existing meeting #{params[:meetingID]} on BigBlueButton server #{server.id}.")
     rescue ApplicationRedisRecord::RecordNotFound
-      raise InternalError, 'Could not find any available servers.'
+      begin
+        # Find available server and create meeting on it
+        server = Server.find_available(params[:'meta_server-tag'])
+
+        # Create meeting in database
+        logger.debug("Creating meeting #{params[:meetingID]} in database.")
+        moderator_pwd = params[:moderatorPW].presence || SecureRandom.alphanumeric(8)
+        meeting = Meeting.find_or_create_with_server!(
+          params[:meetingID],
+          server,
+          moderator_pwd,
+          params[:voiceBridge],
+          @tenant&.id
+        )
+
+        # Update server if meeting (unexpectedly) already existed on a different server
+        server = meeting.server
+
+        logger.debug("Incrementing server #{server.id} load by 1")
+        server.increment_load(1)
+
+        # Pass the generated moderatorPW only on new meeting create
+        params[:moderatorPW] = meeting.moderator_pw
+      rescue ApplicationRedisRecord::RecordNotFound => e
+        raise InternalError, e.message
+      end
     end
 
-    # Create meeting in database
-    logger.debug("Creating meeting #{params[:meetingID]} in database.")
+    params[:voiceBridge] = meeting.voice_bridge
 
-    moderator_pwd = params[:moderatorPW].presence || SecureRandom.alphanumeric(8)
-    params[:moderatorPW] = moderator_pwd
-    meeting = Meeting.find_or_create_with_server(params[:meetingID], server, moderator_pwd)
+    if @tenant.present?
+      params[:'meta_tenant-id'] = @tenant.id
+      params[:'meta_tenant-name'] = @tenant.name
+    end
 
-    # Update with old server if meeting already existed in database
-    server = meeting.server
-
-    logger.debug("Incrementing server #{server.id} load by 1")
-    server.increment_load(1)
+    if server.tag.present?
+      params[:'meta_server-tag'] = server.tag
+    else
+      params.delete(:'meta_server-tag')
+    end
 
     duration = params[:duration].to_i
 
@@ -167,32 +235,26 @@ class BigBlueButtonApiController < ApplicationController
       params[:duration] = Rails.configuration.x.max_meeting_duration
     end
 
-    logger.debug("Creating meeting #{params[:meetingID]} on BigBlueButton server #{server.id}")
+    if @tenant&.lrs_endpoint.present?
+      lrs_payload = LrsPayloadService.new(tenant: @tenant, secret: server.secret).call
+      params[:'meta_secret-lrs-payload'] = lrs_payload if lrs_payload.present?
+    end
 
+    have_preuploaded_slide = request.post? && request.content_mime_type == Mime[:xml]
+
+    logger.debug("Creating meeting #{params[:meetingID]} on BigBlueButton server #{server.id}")
+    params_hash = params
+
+    # EventHandler will handle all the events associated with the create action
+    params = EventHandler.new(params_hash, meeting.id, @tenant).handle
     # Get list of params that should not be modified by create API call
     excluded_params = Rails.configuration.x.create_exclude_params
-
     # Pass along all params except the built in rails ones and excluded_params
     uri = encode_bbb_uri('create', server.url, server.secret, pass_through_params(excluded_params))
 
-    callback_data = nil
-    callback_url = params['meta_bn-recording-ready-url']
-    # For compatibility with some 3rd party implementations, look up for meta_bbb-recording-ready-url or
-    # meta_canvas-recording-ready, when meta_bn-recording-ready-url is not included.
-    callback_url ||= params['meta_bbb-recording-ready-url']
-    callback_url ||= params['meta_canvas-recording-ready-url']
-
     begin
-      if callback_url.present?
-        callback_attributes = { recording_ready_url: callback_url }
-        callback_data = CallbackData.first_or_create!(meeting_id: meeting.id, callback_attributes: callback_attributes)
-        params['meta_bn-recording-ready-url'] = nil
-        params['meta_bbb-recording-ready-url'] = nil
-        params['meta_canvas-recording-ready-url'] = nil
-      end
-
-      # Read the body if POST
-      body = request.post? ? request.body.read : ''
+      # Read the body if preuploaded slide XML is present
+      body = have_preuploaded_slide ? request.raw_post : ''
 
       # Send a GET/POST request to the server
       response = get_post_req(uri, body, **bbb_req_timeout(server))
@@ -200,8 +262,8 @@ class BigBlueButtonApiController < ApplicationController
       # Reraise the error to return error xml to caller
       raise
     rescue StandardError => e
-      callback_data&.destroy!
       logger.warn("Error #{e} creating meeting #{params[:meetingID]} on server #{server.id}.")
+      logger.debug { e.full_message }
       raise InternalError, 'Unable to create meeting on server.'
     end
 
@@ -213,7 +275,7 @@ class BigBlueButtonApiController < ApplicationController
     params.require(:meetingID)
 
     begin
-      meeting = Meeting.find(params[:meetingID])
+      meeting = Meeting.find(params[:meetingID], @tenant&.id)
     rescue ApplicationRedisRecord::RecordNotFound
       # Respond with MeetingNotFoundError if the meeting could not be found
       logger.info("The requested meeting #{params[:meetingID]} does not exist")
@@ -253,16 +315,21 @@ class BigBlueButtonApiController < ApplicationController
 
   def join
     params.require(:meetingID)
-
     begin
-      meeting = Meeting.find(params[:meetingID])
+      meeting = Meeting.find(params[:meetingID], @tenant&.id)
+      server = meeting.server
+      raise ServerUnavailableError if server.offline? || server.disabled?
+    rescue ServerUnavailableError
+      logger.error("The server #{server.id} for meeting #{meeting.id} is offline") if server.offline?
+      logger.error("The server #{server.id} for meeting #{meeting.id} has been disabled") if server.disabled?
+      raise ServerDisabledError
     rescue ApplicationRedisRecord::RecordNotFound
       # Respond with MeetingNotFoundError if the meeting could not be found
       logger.info("The requested meeting #{params[:meetingID]} does not exist")
       raise MeetingNotFoundError
     end
-
-    server = meeting.server
+    logger.debug("Incrementing server #{server.id} load by 1")
+    server.increment_load(1)
 
     # Get list of params that should not be modified by join API call
     excluded_params = Rails.configuration.x.join_exclude_params
@@ -272,16 +339,71 @@ class BigBlueButtonApiController < ApplicationController
 
     # Redirect the user to the join url
     logger.debug("Redirecting user to join url: #{uri}")
-    redirect_to(uri.to_s)
+    redirect_to(uri.to_s, allow_other_host: true)
+  end
+
+  def insert_document
+    params.require(:meetingID)
+
+    begin
+      meeting = Meeting.find(params[:meetingID], @tenant&.id)
+    rescue ApplicationRedisRecord::RecordNotFound # Respond with MeetingNotFoundError if the meeting could not be found
+      logger.info("The requested meeting #{params[:meetingID]} does not exist")
+      raise MeetingNotFoundError
+    end
+
+    server = meeting.server
+    begin
+      # Send a POST request to the server
+      response = get_post_req(
+        encode_bbb_uri('insertDocument', server.url, server.secret, meetingID: params[:meetingID]),
+        request.body.read,
+        **bbb_req_timeout(server)
+      )
+    rescue BBBError
+      # Reraise the error to return error xml to caller
+      raise
+    rescue StandardError => e
+      logger.warn("Error #{e} inserting document into meeting #{params[:meetingID]} on server #{server.id}.")
+      logger.debug { e.full_message }
+      raise InternalError, 'Unable to insert document on server.'
+    end
+
+    # Render response from the server
+    render(xml: response)
   end
 
   def get_recordings
-    query = Recording.includes(playback_formats: [:thumbnails], metadata: [])
+    if Rails.configuration.x.get_recordings_api_filtered && (params[:recordID].blank? && params[:meetingID].blank?)
+      raise BBBError.new('missingParameters', 'param meetingID or recordID must be included.')
+    end
+
+    query = Recording.includes(playback_formats: [:thumbnails], metadata: []).left_joins(:metadata).distinct
+
+    query = query.where(metadata: { key: "tenant-id", value: @tenant.id }) if @tenant.present?
+
+    query = if params[:state].present?
+              states = params[:state].split(',')
+              states.include?('any') ? query : query.where(state: states)
+            else
+              query.state_is_published_unpublished
+            end
+    meta_params = params.select { |key, _value| key.to_s.match(/^meta_/) }.permit!.to_h.to_a
+    if meta_params.present?
+      meta_query = '(metadata.key = ? and metadata.value in (?))'
+      meta_values = [meta_params[0][0].remove('meta_'), meta_params[0][1].split(',')]
+      meta_params[1..].each do |val|
+        meta_query += ' or (metadata.key = ? and metadata.value in (?))'
+        meta_values << val[0].remove('meta_')
+        meta_values << val[1].split(',')
+      end
+      query = query.where(meta_query.to_s, *meta_values)
+    end
     query = query.with_recording_id_prefixes(params[:recordID].split(',')) if params[:recordID].present?
     query = query.where(meeting_id: params[:meetingID].split(',')) if params[:meetingID].present?
 
     @recordings = query.order(starttime: :desc).all
-    @url_prefix = "#{request.protocol}#{request.host}"
+    @url_prefix = "#{request.protocol}#{request.host_with_port}"
 
     render(:get_recordings)
   end
@@ -292,7 +414,11 @@ class BigBlueButtonApiController < ApplicationController
 
     publish = params[:publish].casecmp('true').zero?
 
-    query = Recording.where(record_id: params[:recordID].split(','), state: 'published').load
+    query_params = { record_id: params[:recordID].split(',') }
+    query_params[:metadata] = { key: 'tenant-id', value: @tenant.id } if @tenant.present? # filter based on tenant
+
+    query = Recording.includes(:metadata).where(query_params).load
+    query = query.state_is_published_unpublished
     raise BBBError.new('notFound', 'We could not find recordings') if query.none?
 
     query.where.not(published: publish).each do |rec|
@@ -326,8 +452,8 @@ class BigBlueButtonApiController < ApplicationController
           FileUtils.mkdir_p(format_dir)
           FileUtils.mv(recording_path, format_dir)
         end
-
-        rec.update(published: publish)
+        state = publish ? 'published' : 'unpublished'
+        rec.update!(published: publish, publish_updated: true, state: state)
       rescue StandardError => e
         logger.warn("Error #{e} setting published=#{publish} recording #{rec.record_id}")
         raise InternalError, 'Unable to publish/unpublish recording.'
@@ -340,13 +466,23 @@ class BigBlueButtonApiController < ApplicationController
 
   def update_recordings
     raise BBBError.new('missingParamRecordID', 'You must specify a recordID.') if params[:recordID].blank?
+    record_ids = params[:recordID].split(',')
+
+    query_params = { record_id: record_ids }
+    query_params[:metadata] = { key: 'tenant-id', value: @tenant.id } if @tenant.present? # filter based on tenant
+
+    # Check to make sure all recordings belong to the current tenant
+    if Recording.includes(:metadata).where(query_params).count != record_ids.count
+      @updated = false
+      return render(:update_recordings)
+    end
 
     add_metadata = {}
     remove_metadata = []
     params.each do |key, value|
       next unless key.start_with?('meta_')
 
-      key = key[5..-1].downcase
+      key = key[5..].downcase
 
       if value.blank?
         remove_metadata << key
@@ -357,30 +493,48 @@ class BigBlueButtonApiController < ApplicationController
 
     logger.debug("Adding metadata: #{add_metadata}")
     logger.debug("Removing metadata: #{remove_metadata}")
-
-    record_ids = params[:recordID].split(',')
+    recording_updated = false
     Metadatum.transaction do
       Metadatum.upsert_by_record_id(record_ids, add_metadata)
       Metadatum.delete_by_record_id(record_ids, remove_metadata)
+      recording_updated = Recording.find_by(record_id: record_ids.first).update!(protected: params[:protect]) if params[:protect].present?
     end
 
-    @updated = !(add_metadata.empty? && remove_metadata.empty?)
+    @updated = !(add_metadata.empty? && remove_metadata.empty?) || recording_updated
     render(:update_recordings)
   end
 
   def delete_recordings
     raise BBBError.new('missingParamRecordID', 'You must specify a recordID.') if params[:recordID].blank?
 
-    query = Recording.where(record_id: params[:recordID].split(',')).load
+    query_params = { record_id: params[:recordID].split(',') }
+    query_params[:metadata] = { key: 'tenant-id', value: @tenant.id } if @tenant.present? # filter based on tenant
+
+    query = Recording.includes(:metadata, :playback_formats).where(query_params).load
     raise BBBError.new('notFound', 'We could not find recordings') if query.none?
+
+    s3_client = Aws::S3::Client.new if ENV['S3_RECORDING']
 
     query.each do |rec|
       # Start transaction + lock record
       rec.with_lock do
         logger.debug("Deleting recording: #{rec.record_id}")
-        # TODO: check the unpublished dir when it is implemented
-        FileUtils.rm_r(Dir.glob(File.join(Rails.configuration.x.recording_publish_dir, '/*/', rec.record_id)))
-        rec.destroy!
+        if ENV['S3_RECORDING']
+          bucket = ENV.fetch('S3_BUCKET_NAME')
+          state = rec.published ? 'published' : 'unpublished'
+
+          rec.playback_formats.each do |playback_format|
+            prefix = "#{state}/#{playback_format.format}/#{rec.record_id}/"
+            objects = s3_client.list_objects_v2(bucket: bucket, prefix: prefix).contents
+            next if objects.empty?
+
+            s3_client.delete_objects(bucket: bucket, delete: { objects: objects.map { |o| { key: o.key } } })
+          end
+        else
+          # TODO: check the unpublished dir when it is implemented
+          FileUtils.rm_r(Dir.glob(File.join(Rails.configuration.x.recording_publish_dir, '/*/', rec.record_id)))
+        end
+        rec.mark_delete!
       rescue StandardError => e
         logger.warn("Error #{e} deleting recording #{rec.record_id}")
         raise InternalError, 'Unable to delete recording.'
@@ -401,14 +555,43 @@ class BigBlueButtonApiController < ApplicationController
     raise BBBError.new('notFound', 'We could not find recordings')
   end
 
+  def analytics_callback
+    token = request.headers['HTTP_AUTHORIZATION'].gsub('Bearer ', '')
+    raise 'Token Invalid' unless valid_token?(token)
+
+    meeting_id = params['meeting_id']
+
+    logger.info("Making analytics callback for #{meeting_id}")
+    callback_data = CallbackData.find_by(meeting_id: meeting_id)
+    analytics_callback_url = callback_data&.callback_attributes&.dig(:analytics_callback_url)
+    return if analytics_callback_url.nil?
+
+    params['customer'] = @tenant&.name || 'scalelite'
+
+    uri = URI.parse(analytics_callback_url)
+    post_req(uri, params, @tenant&.name)
+  rescue StandardError => e
+    logger.info('Rescued')
+    logger.info(e.to_s)
+  end
+
   private
 
   # Filter out unneeded params when passing through to join and create calls
   # Has to be to_unsafe_hash since to_h only accepts permitted attributes
   def pass_through_params(excluded_params)
-    params.except(*(excluded_params +
-    [:format, :controller, :action, :checksum]))
+    params.except(*(excluded_params + [:format, :controller, :action, :checksum]))
           .to_unsafe_hash
+  end
+
+  def meeting_running_on_server?(meeting)
+    server = meeting.server
+    uri = encode_bbb_uri('isMeetingRunning', server.url, server.secret, 'meetingID' => meeting.id)
+    response = get_post_req(uri, **bbb_req_timeout(server))
+    response.at_xpath('/response/running')&.text == 'true'
+  rescue StandardError => e
+    logger.warn("Could not verify meeting #{meeting.id} on cordoned server #{server.id}: #{e}")
+    false
   end
 
   # Success response if there are no meetings on any servers

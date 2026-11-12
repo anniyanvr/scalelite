@@ -2,36 +2,158 @@
 
 require 'net/http'
 
+# The following is necessary to fix a DNS resolution timeout bug see https://github.com/ruby/ruby/pull/597#issuecomment-40507119
+require 'resolv-replace'
+
 module ApiHelper
   extend ActiveSupport::Concern
   include BBBErrors
 
-  CHECKSUM_LENGTH = 40
+  CHECKSUM_LENGTH_SHA1 = 40
+  CHECKSUM_LENGTH_SHA256 = 64
+  CHECKSUM_LENGTH_SHA512 = 128
 
   # Verify checksum
-  def verify_checksum
-    raise ChecksumError unless params[:checksum].present? && params[:checksum].length == CHECKSUM_LENGTH
+  #
+  # @param [boolean] force_loadbalancer_secret. Set true for API endpoints (such as the tenants API)
+  #     which should be accessed only by superadmins.
+  def verify_checksum(force_loadbalancer_secret = false)
+    # Reject if request method was overwritten
+    raise ChecksumError if request.method != request.request_method
+    # Reject body parameters on non-POST requests, since the checksum does not cover them
+    raise ChecksumError if !request.post? && request.request_parameters.present?
 
-    # Camel case (ex) get_meetings to getMeetings to match BBB server
-    check_string = action_name.camelcase(:lower)
-    check_string += request.query_string.gsub(
-      /&checksum=#{params[:checksum]}|checksum=#{params[:checksum]}&|checksum=#{params[:checksum]}/, ''
-    )
+    secrets = fetch_secrets(force_loadbalancer_secret: force_loadbalancer_secret)
+    raise ChecksumError if secrets.empty?
 
-    return if Rails.configuration.x.loadbalancer_secrets.any? do |secret|
-      checksum = Digest::SHA1.hexdigest(check_string + secret)
-      ActiveSupport::SecurityUtils.fixed_length_secure_compare(checksum, params[:checksum])
+    checksum = request.params[:checksum]
+    raise ChecksumError if checksum.blank?
+
+    algorithm = guess_checksum_digest_algorithm(checksum)
+    allowed_checksum_algorithms = Rails.configuration.x.loadbalancer_checksum_algorithms
+    raise ChecksumError unless allowed_checksum_algorithms.include?(algorithm)
+
+    check_string = action_name.camelcase(:lower) + query_string_remove_checksum
+    return true if secrets.any? do |secret|
+      ActiveSupport::SecurityUtils.secure_compare(get_checksum(check_string + secret, algorithm), checksum)
     end
 
     raise ChecksumError
+  end
+
+  # BigBlueButton API parameters are plain strings; drop array or hash shaped ones
+  def remove_non_scalar_params
+    params.delete_if { |_key, value| value.is_a?(Array) || value.is_a?(ActionController::Parameters) }
+  end
+
+  # Lowercase meta_ params like BigBlueButton does, and reject duplicates
+  def normalize_meta_params
+    meta_keys = params.keys.grep(/\Ameta_/i)
+    meta_keys.each { |key| params[key.downcase] = params.delete(key) unless key == key.downcase }
+    raise ChecksumError if params.keys.grep(/\Ameta_/i).size < meta_keys.size
+  end
+
+  # Remove the checksum from the request query string. This is done as string manipulation, rather than decoding then re-encoding the parameters,
+  # since there's multiple possible valid encodings for query parameters, and the one used by Ruby might not match.
+  # Only a whole checksum parameter is removed, and more than one is rejected (POST requests may send it in the body instead).
+  def query_string_remove_checksum
+    segments = request.query_string.split('&', -1)
+    checksum_segments = segments.select { |segment| segment.start_with?('checksum=') }
+    raise ChecksumError if checksum_segments.length > 1
+
+    (segments - checksum_segments).join('&')
+  end
+
+  def guess_checksum_digest_algorithm(checksum)
+    case checksum.length
+    when CHECKSUM_LENGTH_SHA1 then 'SHA1'
+    when CHECKSUM_LENGTH_SHA256 then 'SHA256'
+    when CHECKSUM_LENGTH_SHA512 then 'SHA512'
+    else raise ChecksumError
+    end
+  end
+
+  def fetch_secrets(tenant_name: nil, force_loadbalancer_secret: false)
+    return Rails.configuration.x.loadbalancer_secrets if force_loadbalancer_secret || !Rails.configuration.x.multitenancy_enabled
+
+    tenant = fetch_tenant(name: tenant_name)
+    if tenant.present?
+      tenant.secrets_array
+    else
+      Rails.configuration.x.loadbalancer_secrets
+    end
+  end
+
+  def fetch_tenant_name_from_url
+    request.host.split(".").first
+  end
+
+  def set_tenant
+    @tenant = fetch_tenant
+  end
+
+  def fetch_tenant(name: nil)
+    return nil unless Rails.configuration.x.multitenancy_enabled
+
+    tenant_name = name.presence || fetch_tenant_name_from_url
+    tenant = Tenant.find_by_name(tenant_name)
+    raise ChecksumError if tenant.blank?
+
+    tenant
+  end
+
+  def get_checksum(check_string, checksum_algorithm)
+    return Digest::SHA512.hexdigest(check_string) if checksum_algorithm == 'SHA512'
+    return Digest::SHA256.hexdigest(check_string) if checksum_algorithm == 'SHA256'
+    Digest::SHA1.hexdigest(check_string)
+  end
+
+  def checksum_algorithm
+    # default to SHA256 unless explicitly specified
+    return 'SHA256' if ENV['LOADBALANCER_CHECKSUM_ALGORITHM'].blank?
+    # rubocop:enable Rails/EnvironmentVariableAccess
+
+    algos = Rails.configuration.x.loadbalancer_checksum_algorithms
+
+    if algos.include? "SHA512"
+      "SHA512"
+    elsif algos.include? "SHA256"
+      "SHA256"
+    else
+      "SHA1"
+    end
+  end
+
+  # Verify that the Content-Type of POST requests is a "form data" type (applies to most APIs)
+  def verify_content_type
+    return unless request.post? && request.content_length.positive?
+    raise UnsupportedContentType unless request.form_data?
+  end
+
+  # Verify that the Content-Type of a POST request is a format permitted by the create API.
+  # This can either be form data containing params, or an XML document for pre-uploaded slides
+  CREATE_PERMITTED_CONTENT_TYPES = Set.new([Mime[:url_encoded_form], Mime[:multipart_form], Mime[:xml]]).freeze
+  def verify_create_content_type
+    return unless request.post? && request.content_length.positive?
+    raise UnsupportedContentType unless CREATE_PERMITTED_CONTENT_TYPES.include?(request.content_mime_type)
+  end
+
+  # Verify that the Content-Type of a POST request is a format permitted by the insertDocument API.
+  # Only an XML document for pre-uploaded slides (same format as create) is permitted.
+  def verify_insert_document_content_type
+    return unless request.post? && request.content_length.positive?
+    raise UnsupportedContentType unless request.content_mime_type == Mime[:xml]
   end
 
   # Encode URI and append checksum
   def encode_bbb_uri(action, base_uri, secret, bbb_params = {})
     # Add slash at the end if its not there
     base_uri += '/' unless base_uri.ends_with?('/')
+
+    bbb_params = add_additional_params(action, bbb_params)
     check_string = URI.encode_www_form(bbb_params)
-    checksum = Digest::SHA1.hexdigest(action + check_string + secret)
+    checksum = get_checksum(action + check_string + secret, checksum_algorithm)
+
     uri = URI.join(base_uri, action)
     uri.query = URI.encode_www_form(bbb_params.merge(checksum: checksum))
     uri
@@ -43,12 +165,61 @@ module ApiHelper
       # Use values that are 1/10 the normal values, but clamp to a minimum.
       # If the original configured timeout value is below the minimum, then use that instead.
       return {
-        open_timeout: [[0.2, Rails.configuration.x.open_timeout].min, Rails.configuration.x.open_timeout / 10].max,
-        read_timeout: [[0.5, Rails.configuration.x.read_timeout].min, Rails.configuration.x.read_timeout / 10].max,
+        open_timeout: 0.2.clamp(Rails.configuration.x.read_timeout / 10, Rails.configuration.x.read_timeout),
+        read_timeout: 0.5.clamp(Rails.configuration.x.read_timeout / 10, Rails.configuration.x.read_timeout),
       }
     end
 
     {}
+  end
+
+  def encoded_token(payload, secret)
+    JWT.encode(payload, secret, 'HS512', typ: 'JWT')
+  end
+
+  def decoded_token(token)
+    secrets = []
+    Server.all.each do |server|
+      secrets << server.secret
+    end
+
+    secrets.any? do |secret|
+      JWT.decode(token, secret, true, algorithm: 'HS512')
+    rescue JWT::DecodeError
+      false
+    end
+  end
+
+  def valid_token?(token)
+    decoded_token(token)
+  end
+
+  def post_req(uri, body, tenant = nil)
+    secrets = fetch_secrets(tenant_name: tenant)
+
+    secrets.each do |secret|
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = (uri.scheme == 'https')
+      payload = { exp: Time.now.to_i + (24 * 3600) }
+      token = encoded_token(payload, secret)
+      # Setup a request and attach our JWT token
+      request = Net::HTTP::Post.new(uri.request_uri,
+                                    'Content-Type' => 'application/json',
+                                    'Authorization' => "Bearer #{token}",
+                                    'User-Agent' => 'BigBlueButton Analytics Callback')
+      # Send out data as json body
+      request.body = body.to_json
+      logger.info("Sending request to #{uri.scheme}://#{uri.host}#{uri.request_uri}")
+      response = http.request(request)
+      code = response.code.to_i
+
+      if code < 200 || code >= 300
+        logger.info("Analytics callback request failed: #{response.code} #{response.message} (code #{code}) .. Trying next secret...")
+      else
+        logger.info("Analytics callback successful for meeting: #{body['meeting_id']} (code #{code})")
+        break
+      end
+    end
   end
 
   # GET/POST request
@@ -73,11 +244,56 @@ module ApiHelper
       doc = Nokogiri::XML(res.body)
       returncode = doc.at_xpath('/response/returncode')
       raise InternalError, 'Response did not include returncode' if returncode.nil?
-      if returncode.content != 'SUCCESS'
-        raise BBBError.new(doc.at_xpath('/response/messageKey').content, doc.at_xpath('/response/message').content)
-      end
+      raise BBBError.new(doc.at_xpath('/response/messageKey').content, doc.at_xpath('/response/message').content) if returncode.content != 'SUCCESS'
 
       doc
     end
+  end
+
+  def add_additional_params(action, bbb_params)
+    bbb_params = bbb_params.symbolize_keys
+    final_params = bbb_params
+
+    default, override = if %w[create join].include? action
+      TenantSetting.defaults_and_overrides(@tenant&.id)
+    else
+      [{}, {}]
+    end
+    # Server tag is handled separately in create call
+    default.delete(:'meta_server-tag')
+    override.delete(:'meta_server-tag')
+
+    final_params = default&.merge(final_params)
+
+    case action
+    when 'create'
+      # Merge with the default (bbb_params takes precedence)
+      final_params = Rails.configuration.x.default_create_params.except(:'meta_server-tag').merge(final_params)
+      # Merge with the override (override takes precedence)
+      final_params.merge!(Rails.configuration.x.override_create_params.except(:'meta_server-tag'))
+    when 'join'
+      # Merge with the default (bbb_params takes precedence)
+      final_params = Rails.configuration.x.default_join_params.merge(final_params)
+      # Merge with the override (override takes precedence)
+      final_params.merge!(Rails.configuration.x.override_join_params)
+    end
+
+    final_params&.merge!(override)
+
+    final_params
+  end
+
+  # early handling of server tag in default/override create settings
+  def apply_config_server_tag(params)
+    default = Rails.configuration.x.default_create_params
+    override = Rails.configuration.x.override_create_params
+    default_tenant, override_tenant = TenantSetting.defaults_and_overrides(@tenant&.id)
+
+    params[:'meta_server-tag'] =
+      override_tenant[:'meta_server-tag'].presence ||
+      override[:'meta_server-tag'].presence ||
+      params[:'meta_server-tag'].presence ||
+      default_tenant[:'meta_server-tag'].presence ||
+      default[:'meta_server-tag'].presence
   end
 end

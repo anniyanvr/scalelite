@@ -40,10 +40,13 @@ end
 
 props = Psych.load_file(File.join(__dir__, '../bigbluebutton.yml'))
 published_dir = props['published_dir'] || raise('Unable to determine published_dir from bigbluebutton.yml')
+recording_dir = props['recording_dir'] || raise('Unable to determine recording_dir from bigbluebutton.yml')
+
 scalelite_props = Psych.load_file(File.join(__dir__, '../scalelite.yml'))
 work_dir = scalelite_props['work_dir'] || raise('Unable to determine work_dir from scalelite.yml')
 spool_dir = scalelite_props['spool_dir'] || raise('Unable to determine spool_dir from scalelite.yml')
 extra_rsync_opts = scalelite_props['extra_rsync_opts'] || []
+delete_recording = scalelite_props['delete_recording']
 
 puts("Transferring recording for #{meeting_id} to Scalelite")
 format_dirs = []
@@ -69,10 +72,17 @@ begin
   end
 
   puts("Transferring recording archive to #{spool_dir}")
-  system('rsync', '--verbose', '--protect-args', *extra_rsync_opts, archive_file, spool_dir) \
+  system('rsync', '--verbose', '--remove-source-files', '--protect-args', *extra_rsync_opts, archive_file, spool_dir) \
     || raise('Failed to transfer recording archive')
 
+  # Delete recording after transfer
+  if delete_recording
+    puts('Deleting local recording')
+    system('bbb-record', '--delete', meeting_id) || raise('Failed to delete local recording')
+  end
+
+  puts('Create sender.done file')
+  File.write("#{recording_dir}/status/published/#{meeting_id}-sender.done", "Published #{meeting_id}")
+
   puts('Recording transferring to Scalelite ends')
-ensure
-  FileUtils.rm_f(archive_file)
 end

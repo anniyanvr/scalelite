@@ -1,0 +1,42 @@
+#!/bin/bash
+
+# Place this file in /etc/cron.daily and make sure it is executable
+#
+
+# Delete sent recording after 4 days
+MAXAGE=4
+
+# Delete raw files after 4 days
+RAW_MAXAGE=4
+
+LOGFILE=/var/log/bigbluebutton/bbb-sender-cleanup.log
+
+shopt -s nullglob
+
+NOW=$(date +%s)
+
+echo "$(date --rfc-3339=seconds) Deleting sent recordings older than ${MAXAGE} days" >>"${LOGFILE}"
+
+# Iterate through the list of recordings for which sender publishing has
+# completed
+for donefile in /var/bigbluebutton/recording/status/published/*-sender.done ; do
+        MTIME=$(stat -c %Y "${donefile}")
+        # Check the age of the recording
+        if [ $(( ( $NOW - $MTIME ) / 86400 )) -gt $MAXAGE ]; then
+                MEETING_ID=$(basename "${donefile}")
+                MEETING_ID=${MEETING_ID%-sender.done}
+                echo "${MEETING_ID}" >> "${LOGFILE}"
+
+                bbb-record --delete "${MEETING_ID}" >> "${LOGFILE}"
+        fi
+done
+
+echo "$(date --rfc-3339=seconds) Deleting raw files older than ${RAW_MAXAGE}"
+for eventsfile in /var/bigbluebutton/recording/raw/*/events.xml ; do
+        MTIME=$(stat -c %Y "${eventsfile}")
+        if [ $(( ( $NOW - $MTIME ) / 86400 )) -gt $RAW_MAXAGE ]; then
+                RAW_DIR="${eventsfile%/*}"
+                rm -rv "${RAW_DIR}" >>"${LOGFILE}" 2>&1
+        fi
+done
+

@@ -1,11 +1,10 @@
 default: &default
   url: <%= ENV['REDIS_URL'] %>
   pool: <%= ENV.fetch('REDIS_POOL') { ENV.fetch('RAILS_MAX_THREADS') { 5 } } %>
-  driver: hiredis
 
 development:
   <<: *default
-  namespace: scalelite_development
+  namespace: <%= ENV.fetch('REDIS_NAMESPACE') { 'scalelite_development' } %>
 
 test:
   <<: *default

@@ -5,8 +5,9 @@ require_relative '../config/environment'
 require 'rails/test_help'
 require 'fakeredis/minitest'
 require 'webmock/minitest'
-require 'minitest/stub_any_instance'
+require 'minitest/autorun'
 require 'minitest/mock'
+require 'minitest/stub_any_instance'
 
 module ActiveSupport
   class TestCase
@@ -18,7 +19,7 @@ module ActiveSupport
     # Add more helper methods to be used by all tests here...
 
     def encode_bbb_params(api_method, query_string)
-      checksum = ::Digest::SHA1.hexdigest("#{api_method}#{query_string}#{Rails.configuration.x.loadbalancer_secrets[0]}")
+      checksum = ::Digest::SHA256.hexdigest("#{api_method}#{query_string}#{Rails.configuration.x.loadbalancer_secrets[0]}")
       if query_string.blank?
         "checksum=#{checksum}"
       else
@@ -39,6 +40,19 @@ module ActiveSupport
         ENV.replace(old)
         reload_routes!
       end
+    end
+
+    def meeting_create_response(meeting_id, moderator_pw = 'mp', attendee_pw = 'ap')
+      Nokogiri::XML::Builder.new do |xml|
+        xml.response {
+          xml.returncode 'SUCCESS'
+          xml.meetingID meeting_id
+          xml.attendeePW attendee_pw
+          xml.moderatorPW moderator_pw
+          xml.messageKey
+          xml.message
+        }
+      end.to_xml
     end
   end
 end

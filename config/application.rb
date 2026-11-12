@@ -14,9 +14,8 @@ require 'action_controller/railtie'
 # require 'action_text/engine'
 require 'action_view/railtie'
 # require 'action_cable/engine'
-# require 'sprockets/railtie'
 require 'rails/test_unit/railtie'
-require 'active_job/railtie'
+require 'active_support/time'
 
 # Require the gems listed in Gemfile, including any gems
 # you've limited to :test, :development, or :production.
@@ -24,33 +23,37 @@ Bundler.require(*Rails.groups)
 
 module Scalelite
   class Application < Rails::Application
-    # Initialize configuration defaults for originally generated Rails version.
-    config.load_defaults(6.0)
+    # Initialize configuration defaults
+    config.load_defaults 8.1
 
-    config.eager_load_paths << Rails.root.join('lib')
+    # Please, add to the `ignore` list any other `lib` subdirectories that do
+    # not contain `.rb` files, or that should not be reloaded or eager loaded.
+    # Common ones are `templates`, `generators`, or `middleware`, for example.
+    config.autoload_lib(ignore: %w[tasks])
 
-    # Settings in config/environments/* take precedence over those specified here.
-    # Application configuration can go into files in config/initializers
-    # -- all .rb files in that directory are automatically loaded after loading
-    # the framework and any gems in your application.
+    # Remove HTTP method override to prevent request method from being overridden
+    config.middleware.delete Rack::MethodOverride
 
-    # Only loads a smaller set of middleware suitable for API only apps.
-    # Middleware like session, flash, cookies can be added back manually.
-    # Skip views, helpers and assets when generating a new resource.
-    config.api_only = true
-
-    config.active_job.queue_adapter = :delayed_job
+    # Configuration for the application, engines, and railties goes here.
+    #
+    # These settings can be overridden in specific environments using the files
+    # in config/environments, which are processed later.
+    #
 
     # Read the file config/redis_store.yml as per-environment configuration with erb
     config.x.redis_store = config_for(:redis_store)
 
     # Build number returned in the /bigbluebutton/api response
-    config.x.build_number = ENV['BUILD_NUMBER']
+    config.x.build_number = ENV.fetch('BUILD_NUMBER', nil)
 
     # Secrets used to verify /bigbluebutton/api requests
     config.x.loadbalancer_secrets = []
     config.x.loadbalancer_secrets.push(ENV['LOADBALANCER_SECRET']) if ENV['LOADBALANCER_SECRET']
     config.x.loadbalancer_secrets.concat(ENV['LOADBALANCER_SECRETS'].split(':')) if ENV['LOADBALANCER_SECRETS']
+
+    # Algorithms used for calculating checksum [SHA1|SHA256|...]
+    config.x.loadbalancer_checksum_algorithm = ENV.fetch('LOADBALANCER_CHECKSUM_ALGORITHM', 'SHA1:SHA256:SHA512')
+    config.x.loadbalancer_checksum_algorithms = config.x.loadbalancer_checksum_algorithm.split(':')
 
     # Defaults to 0 since nil/"".to_i = 0
     config.x.max_meeting_duration = ENV['MAX_MEETING_DURATION'].to_i
@@ -73,20 +76,20 @@ module Scalelite
 
     # Directory to monitor for recordings transferred from BigBlueButton servers
     config.x.recording_spool_dir = File.absolute_path(
-      ENV.fetch('RECORDING_SPOOL_DIR') { '/var/bigbluebutton/spool' }
+      ENV.fetch('RECORDING_SPOOL_DIR', '/var/bigbluebutton/spool')
     )
     # Working directory for temporary files when extracting recordings
     config.x.recording_work_dir = File.absolute_path(
-      ENV.fetch('RECORDING_WORK_DIR') { '/var/bigbluebutton/recording/scalelite' }
+      ENV.fetch('RECORDING_WORK_DIR', '/var/bigbluebutton/recording/scalelite')
     )
     # Published recording directory
     config.x.recording_publish_dir = File.absolute_path(
-      ENV.fetch('RECORDING_PUBLISH_DIR') { '/var/bigbluebutton/published' }
+      ENV.fetch('RECORDING_PUBLISH_DIR', '/var/bigbluebutton/published')
     )
 
     # Unpublished recording directory
     config.x.recording_unpublish_dir = File.absolute_path(
-      ENV.fetch('RECORDING_UNPUBLISH_DIR') { '/var/bigbluebutton/unpublished' }
+      ENV.fetch('RECORDING_UNPUBLISH_DIR', '/var/bigbluebutton/unpublished')
     )
 
     # Minimum user count of a meeting, used for calculating server load. Defaults to 15.
@@ -108,5 +111,82 @@ module Scalelite
 
     # Recordings imported will be unpublished by default, if set to 'true'. Defaults to false.
     config.x.recording_import_unpublished = ENV.fetch('RECORDING_IMPORT_UNPUBLISHED', 'false').casecmp?('true')
+
+    # Multitenancy values
+    config.x.multitenancy_enabled = ENV.fetch('MULTITENANCY_ENABLED', 'false').casecmp?('true')
+
+    # Scalelite Host name
+    config.x.url_host = ENV.fetch('URL_HOST', nil)
+
+    # API Mate URL used to build per-tenant links in the tenants rake task, e.g. https://bigbluebutton.org/api-mate/
+    config.x.api_mate_url = ENV.fetch('API_MATE_URL', nil)
+
+    # DB connection retry attempt counts
+    config.x.db_connection_retry_count = ENV.fetch('DB_CONNECTION_RETRY_COUNT', '3').to_i
+
+    # Prevents get_recordings api from returning all recordings when recordID is not specified in the request, if set to 'true'.
+    # Defaults to false.
+    config.x.get_recordings_api_filtered = ENV.fetch('GET_RECORDINGS_API_FILTERED', 'false').casecmp?('true')
+
+    # Poller threads value, defaults to 5. Needs to be adjusted as per the number of servers to be polled
+    config.x.poller_threads = ENV.fetch('POLLER_THREADS', 5).to_i
+
+    # Poller wait timeout value, timeout value set for the poller to finish polling a server. Defaults to 10.
+    config.x.poller_wait_timeout = ENV.fetch('POLLER_WAIT_TIMEOUT', 10).to_i
+
+    # Recording playback formats handled by Scalelite
+    config.x.recording_playback_formats = ENV.fetch('RECORDING_PLAYBACK_FORMATS',
+                                                    'presentation:video:screenshare:podcast:notes:capture').split(':')
+
+    # Recordings will proctected, if set to 'true'. Defaults to false.
+    config.x.protected_recordings_enabled = ENV.fetch('PROTECTED_RECORDINGS_ENABLED', 'false').casecmp?('true')
+    # Protected recordings token timeout in minutes. Defaults to 60 (1 hour)
+    config.x.recording_token_ttl = ENV.fetch('PROTECTED_RECORDINGS_TOKEN_TIMEOUT', '60').to_i.minutes
+    # Protected recordings resource access cookie timeout in minutes. Defaults to 360 (6 hours)
+    config.x.recording_cookie_ttl = ENV.fetch('PROTECTED_RECORDINGS_TIMEOUT', '360').to_i.minutes
+
+    config.i18n.default_locale = ENV.fetch('DEFAULT_LOCALE', 'en')
+
+    # Comma separated list of create params that can be overridden by the client
+    config.x.default_create_params = ENV.fetch('DEFAULT_CREATE_PARAMS', '')
+                                        .split(',').to_h { |param| param.split('=', 2) }.symbolize_keys
+    # Comma separated list of create params that CANT be overridden by the client
+    config.x.override_create_params = ENV.fetch('OVERRIDE_CREATE_PARAMS', '')
+                                         .split(',').to_h { |param| param.split('=', 2) }.symbolize_keys
+    # Comma separated list of join params that can be overridden by the client
+    config.x.default_join_params = ENV.fetch('DEFAULT_JOIN_PARAMS', '')
+                                      .split(',').to_h { |param| param.split('=', 2) }.symbolize_keys
+    # Comma separated list of join params that CANT be overridden by the client
+    config.x.override_join_params = ENV.fetch('OVERRIDE_JOIN_PARAMS', '')
+                                       .split(',').to_h { |param| param.split('=', 2) }.symbolize_keys
+
+    # The length (number of digits) of voice bridge numbers to allocate
+    config.x.voice_bridge_len = ENV.fetch('VOICE_BRIDGE_LEN', 9).to_i
+
+    # The length (number of digits) of voice bridge numbers to allocate
+    config.x.voice_bridge_min = ENV.fetch('VOICE_BRIDGE_MIN', 5).to_i
+
+    # The length (number of digits) of voice bridge numbers to allocate
+    config.x.voice_bridge_max = ENV.fetch('VOICE_BRIDGE_MAX', 9).to_i
+
+    # Whether to try to use the voice bridge number requested on the BigBlueButton create API call.
+    config.x.use_external_voice_bridge = ENV.fetch('USE_EXTERNAL_VOICE_BRIDGE', 'false').casecmp?('true')
+
+    # Password to access the freeswitch dialplan API
+    config.x.fsapi_password = ENV.fetch('FSAPI_PASSWORD', config.x.loadbalancer_secrets[0])
+
+    # Maximum amount of time to allow bridged calls to stay connected for. Defaults to same as max meeting duration.
+    config.x.fsapi_max_duration = ENV.fetch('FSAPI_MAX_DURATION', config.x.max_meeting_duration).to_i
+
+    # Default meeting TTL before redis deletes a meeting
+    config.x.default_meeting_ttl = ENV.fetch('DEFAULT_MEETING_TTL', 24 * 60 * 60).to_i # 24 hours in seconds
+
+    # Restore default serializer from Rails defaults < 7.1
+    config.active_record.default_column_serializer = YAML
+
+    # continue using config/secrets.yml for secrets
+    config.secrets = config_for(:secrets)
+
+    config.host_authorization = { exclude: ->(request) { request.path.include?('health_check') } }
   end
 end

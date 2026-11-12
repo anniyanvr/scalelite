@@ -20,7 +20,7 @@ class RecordingTest < ActiveSupport::TestCase
     # Not matching
     create(:recording)
 
-    record_id_prefix = Digest::SHA1.hexdigest(meeting_id)
+    record_id_prefix = Digest::SHA256.hexdigest(meeting_id)
 
     rs = Recording.with_recording_id_prefixes([record_id_prefix])
     assert_equal(2, rs.length)
@@ -41,12 +41,12 @@ class RecordingTest < ActiveSupport::TestCase
     # Not matching
     create(:recording)
 
-    record_id_prefix_a = Digest::SHA1.hexdigest(meeting_id_a)
-    record_id_prefix_b = Digest::SHA1.hexdigest(meeting_id_b)
+    record_id_prefix_a = Digest::SHA256.hexdigest(meeting_id_a)
+    record_id_prefix_b = Digest::SHA256.hexdigest(meeting_id_b)
 
     rs = Recording.with_recording_id_prefixes([record_id_prefix_a, record_id_prefix_b])
     assert_equal(4, rs.length)
-    assert_equal(2, rs.select { |r| r.meeting_id == meeting_id_a }.length)
-    assert_equal(2, rs.select { |r| r.meeting_id == meeting_id_b }.length)
+    assert_equal(2, rs.count { |r| r.meeting_id == meeting_id_a })
+    assert_equal(2, rs.count { |r| r.meeting_id == meeting_id_b })
   end
 end

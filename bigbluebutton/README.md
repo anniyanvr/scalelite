@@ -9,6 +9,22 @@ On each BigBlueButton server, install the following files to the listed paths:
 * `scalelite_post_publish.rb`: install to the directory `/usr/local/bigbluebutton/core/scripts/post_publish`
 * `scalelite.yml`: install to the directory `/usr/local/bigbluebutton/core/scripts`
 
+### Disable recording playback on BigBlueButton
+
+Recordings are served by Scalelite, so the BigBlueButton server should not serve its own copies of them.
+If it does, recordings that are protected, unpublished, or deleted in Scalelite remain publicly readable from the BigBlueButton server.
+
+Disable the BigBlueButton recording playback configuration with `dpkg-divert`, so that package upgrades do not re-enable it:
+
+```sh
+for f in notes-playback podcast presentation presentation-legacy recording-screenshare slides playback-video playback; do
+  dpkg-divert --add --rename /usr/share/bigbluebutton/nginx/$f.nginx
+done
+nginx -t && systemctl reload nginx
+```
+
+It is safe to run this even if some of these playback formats are not installed.
+
 ## Configuration
 
 The file `scalelite.yml` contains configuration for the transfer script.
@@ -61,3 +77,7 @@ Finally (after switching back to root), set the `spool_dir` setting in `scalelit
 ### Other configurations
 
 If you need to customize the rsync command (for example, to pass the `--rsh` option to set up a tunnel), you can add extra rsync command line arguments via the `extra_rsync_opts` array in `scalelite.yml`.
+
+### Recording cleanup cronjob
+
+Copy the script `scalelite_prune_recordings` to `/etc/cron.daily` on the BBB server, to periodically clean up the local files of recordings that have been transferred to Scalelite. You may adjust the variables MAXAGE and EVENTS_MAXAGE to the number of days you would like to keep the local files on the BBB server.

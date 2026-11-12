@@ -9,7 +9,10 @@ module RedisStore
     @mutex.synchronize do
       return @connection_pool if @connection_pool
 
+      # Reading from ENV is probably fine here; only happens once near (but not at) application init,
+      # and it's a fallback, and there's no way exposed in rails to read this value other than ENV.
       pool = Rails.configuration.x.redis_store.pool || ENV['RAILS_MAX_THREADS'] || ConnectionPool::DEFAULTS[:size]
+      # rubocop:enable Rails/EnvironmentVariableAccess
       pool_timeout = Rails.configuration.x.redis_store.pool_timeout || ConnectionPool::DEFAULTS[:timeout]
       @connection_pool = ConnectionPool.new(size: pool, timeout: pool_timeout) do
         redis = Redis.new(Rails.configuration.x.redis_store)
@@ -31,7 +34,7 @@ module RedisStore
     end
   end
 
-  def self.with_connection
-    connection_pool.with { |connection| yield(connection) }
+  def self.with_connection(&)
+    connection_pool.with(&)
   end
 end

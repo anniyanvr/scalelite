@@ -1,33 +1,34 @@
-FROM alpine:3.13 AS alpine
+FROM alpine:3.22.1 AS alpine
 
-FROM ubuntu:16.04 AS bbb-playback
+FROM ubuntu:22.04 AS bbb-playback
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y language-pack-en \
     && update-locale LANG=en_US.UTF-8
 ENV LANG=en_US.UTF-8
 RUN apt-get update \
-    && apt-get install -y software-properties-common curl net-tools
+    && apt-get install -y software-properties-common curl net-tools nginx
+RUN add-apt-repository -y ppa:rmescandon/yq \
+    && apt-get update \
+    && apt-get install -y yq
 RUN curl -sL https://ubuntu.bigbluebutton.org/repo/bigbluebutton.asc | apt-key add - \
-    && echo "deb http://ubuntu.bigbluebutton.org/xenial-220/ bigbluebutton-xenial main" >/etc/apt/sources.list.d/bigbluebutton.list
+    && echo "deb https://ubuntu.bigbluebutton.org/jammy-300 bigbluebutton-jammy main" >/etc/apt/sources.list.d/bigbluebutton.list
 RUN useradd --system --user-group --home-dir /var/bigbluebutton bigbluebutton
 RUN touch /.dockerenv
 RUN apt-get update \
-    && apt-get download bbb-playback-notes bbb-playback-podcast bbb-playback-presentation bbb-playback-screenshare \
-    && dpkg -i --force-depends *.deb
+    && apt-get download bbb-playback bbb-playback-presentation bbb-playback-podcast bbb-playback-screenshare bbb-playback-video \
+    && dpkg -i --force-depends ./*.deb
 
 FROM alpine AS nginx
-RUN apk add --no-cache nginx=1.18.0-r13 tini gettext \
+RUN apk add --no-cache nginx tini gettext \
     && ln -sf /dev/stdout /var/log/nginx/access.log \
     && ln -sf /dev/stderr /var/log/nginx/error.log
-RUN rm /etc/nginx/conf.d/default.conf
-COPY --from=bbb-playback /etc/bigbluebutton/nginx /etc/bigbluebutton/nginx/
+RUN rm /etc/nginx/http.d/default.conf
 COPY --from=bbb-playback /var/bigbluebutton/playback /var/bigbluebutton/playback/
 COPY nginx/start /etc/nginx/start
 COPY nginx/dhparam.pem /etc/nginx/dhparam.pem
 COPY nginx/conf.d /etc/nginx/http.d/
-# This will be needed with alpine 3.14 since conf.d is being phased out.
-# RUN ln -s /etc/nginx/http.d/ /etc/nginx/conf.d
+COPY nginx/playback /etc/bigbluebutton/nginx/
 EXPOSE 80
 EXPOSE 443
 ENV NGINX_HOSTNAME=localhost
@@ -38,16 +39,34 @@ RUN apk add --no-cache \
     libpq \
     libxml2 \
     libxslt \
-    ruby \
-    ruby-irb \
-    ruby-bigdecimal \
-    ruby-bundler \
-    ruby-json \
     tini \
     tzdata \
-    shared-mime-info \
-    && addgroup scalelite --gid 1000 \
-    && adduser -u 1000 -h /srv/scalelite -G scalelite -D scalelite
+    shared-mime-info
+# ruby-start.
+# Install Ruby from sources since Scalelite does not necessarily use the version shipped with Apline.
+ARG RUBY_RELEASE="https://cache.ruby-lang.org/pub/ruby/3.3/ruby-3.3.13.tar.gz"
+ARG RUBY="ruby-3.3.13"
+RUN apk add --no-cache git make gcc g++ libc-dev pkgconfig \
+    libxml2-dev libxslt-dev postgresql-dev coreutils curl wget bash \
+    gnupg tar linux-headers bison readline-dev readline zlib-dev \
+    zlib yaml-dev autoconf ncurses-dev curl-dev apache2-dev \
+    libx11-dev libffi-dev tcl-dev tk-dev
+RUN wget --no-verbose -O ruby.tar.gz ${RUBY_RELEASE} && \
+    tar -xf ruby.tar.gz && \
+    cd /${RUBY} && \
+    ac_cv_func_isnan=yes ac_cv_func_isinf=yes \
+    ./configure --disable-install-doc && \
+    make && \
+    make test && \
+    make install
+RUN cd / && \
+    rm ruby.tar.gz && \
+    rm -rf ${RUBY_NAME}
+# ruby-end.
+RUN addgroup scalelite --gid 1000 && \
+    adduser -u 1000 -h /srv/scalelite -G scalelite -D scalelite
+RUN addgroup scalelite-spool --gid 2000 && \
+    addgroup scalelite scalelite-spool
 WORKDIR /srv/scalelite
 
 FROM base as builder
@@ -70,7 +89,7 @@ RUN rm -rf nginx
 
 FROM base AS application
 USER scalelite:scalelite
-ENV RAILS_ENV=production RAILS_LOG_TO_STDOUT=1
+ENV RAILS_ENV=production RAILS_LOG_TO_STDOUT=true
 COPY --from=builder --chown=scalelite:scalelite /srv/scalelite ./
 
 ARG BUILD_NUMBER

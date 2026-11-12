@@ -3,67 +3,70 @@
 source 'https://rubygems.org'
 git_source(:github) { |repo| "https://github.com/#{repo}.git" }
 
-ruby '>= 2.6.5'
+ruby '>= 3.3'
 
 # Bundle edge Rails instead: gem 'rails', github: 'rails/rails'
-gem 'rails', '~> 6.0.3', '>= 6.0.3.4'
+gem 'rails', '~> 8.1.4'
 # Use Puma as the app server
-gem 'puma', '~> 5.2'
+gem 'puma', '~> 7.2'
+
 # Build JSON APIs with ease. Read more: https://github.com/rails/jbuilder
 # gem 'jbuilder', '~> 2.7'
 # Use Active Model has_secure_password
 # gem 'bcrypt', '~> 3.1.7'
 
 # Redis connection setup for live session (server and meeting) tracking
-gem 'connection_pool', '~> 2.2.2'
-gem 'hiredis', '~> 0.6.3'
-gem 'redis', '~> 4.1.3'
-gem 'redis-namespace', '~> 1.7.0'
+gem 'connection_pool', '~> 2.4.0'
+gem 'redis', '~> 4.8.0'
+gem 'redis-namespace', '~> 1.11.0'
 
 # Use postgresql as the database for Active Record
-gem 'pg', '~> 1.2'
+gem 'pg', '~> 1.4.4'
 
 # Reduces boot times through caching; required in config/boot.rb
-gem 'bootsnap', '>= 1.4.2', require: false
+gem 'bootsnap', '>= 1.16.0', require: false
 
 # Use Rack CORS for handling Cross-Origin Resource Sharing (CORS), making cross-origin AJAX possible
 # gem 'rack-cors'
 
 # Generates a terminal table
-gem 'tabulo', '~> 2.3.0'
+gem 'tabulo', '~> 2.8.1'
 
-# Used by recording watch task. Version limit is for compat with rails auto-reloader.
-gem 'listen', '>= 3.0.5', '< 3.2'
+gem 'jwt', '~> 3.2.0'
 
-# Used to run background jobs
-gem 'delayed_job_active_record'
-
-gem 'daemons'
-
-gem 'jwt', '2.2.3'
+gem 'aws-sdk-cloudfront', '~> 1'
+gem 'aws-sdk-s3', '~> 1'
 
 group :development, :test do
   # Call 'byebug' anywhere in the code to stop execution and get a debugger console
   gem 'byebug', platforms: [:mri, :mingw, :x64_mingw]
-
   # Allow using sqlite as the database for Active Record in development/test env
   gem 'sqlite3'
 
   gem 'dotenv-rails'
   gem 'factory_bot_rails'
+
+  gem 'rspec-rails', '~> 7.1'
+
+  gem 'rubocop', '~> 1.61.0', require: false
+  gem 'rubocop-performance',  require: false
+  gem 'rubocop-rails', '~> 2.19.0', require: false
+  gem 'rubocop-rspec', '~> 2.20', require: false
 end
 
 group :development do
-  gem 'rubocop', '~> 0.79.0', require: false
-  gem 'rubocop-rails', '~> 2.4.0', require: false
   # Spring speeds up development by keeping your application running in the background. Read more: https://github.com/rails/spring
   gem 'spring'
-  gem 'spring-watcher-listen', '~> 2.0.0'
+  gem 'spring-watcher-listen', '~> 2.1.0'
 end
 
 group :test do
-  gem 'fakeredis', github: 'guilleiguaran/fakeredis', ref: '2ebe19229954c7234bed019a0c5d28d5cf5b40f6'
+  gem 'faker'
+  gem 'fakeredis', '~> 0.8'
+  gem 'minitest'
+  gem 'minitest-mock'
   gem 'minitest-stub_any_instance'
+  gem 'rails-controller-testing'
   gem 'webmock'
 end
 
